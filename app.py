@@ -6,16 +6,13 @@
 # For licensing inquiries, please contact oscarmventura@icloud.com
 # /
 
-import pdfplumber
-import difflib
+import pandas as pd
 import tkinter as tk
-from tkinter import filedialog, messagebox, scrolledtext
-import pickle
+from tkinter import filedialog, messagebox, ttk
+import pdfplumber
 import re
-from tabulate import tabulate
 
 def extract_text_from_pdf(pdf_path):
-    """Extracts text from a PDF file line by line."""
     text_lines = []
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
@@ -24,143 +21,114 @@ def extract_text_from_pdf(pdf_path):
                 text_lines.extend(text.split('\n'))
     return text_lines
 
-def categorize_lines(lines):
-    """Categorizes lines based on work area sections."""
-    categories = {}
-    current_category = "General"
+def extract_room_items(lines):
+    rooms = {"General": {}}
+    current_room = "General"
+    
+    construction_categories = [
+        "Drywall", "Flooring", "Baseboards", "Painting", "Ceiling", "Trim", "Doors", "Windows", "Insulation", "Cabinets"
+    ]
     
     for line in lines:
-        match = re.match(r'^(\w+\s*\w*):$', line.strip())
-        if match:
-            current_category = match.group(1)
-            categories[current_category] = []
+        room_match = re.match(r'^(Bedroom|Kitchen|Bathroom|Entry|Dining Room|Living Room|Hallway|Laundry Room|Closet|Garage):$', line.strip(), re.IGNORECASE)
+        if room_match:
+            current_room = room_match.group(1)
+            rooms.setdefault(current_room, {})
         else:
-            categories.setdefault(current_category, []).append(line)
+            category = "Other"
+            for cat in construction_categories:
+                if cat.lower() in line.lower():
+                    category = cat
+                    break
+            
+            cost_match = re.search(r'\$([0-9,]+\.\d*)', line)
+            sf_match = re.search(r'([0-9,]+(?:\.\d+)?)\s?sq\.?\s?ft', line, re.IGNORECASE)
+            cost = float(cost_match.group(1).replace(',', '')) if cost_match else 0
+            sf = float(sf_match.group(1).replace(',', '')) if sf_match else 0
+            
+            rooms[current_room].setdefault(category, [])
+            rooms[current_room][category].append((line, cost, sf))
     
-    return categories
+    return rooms
 
-def compare_estimates(file1, file2):
-    """Compares two estimate files and highlights differences line by line within categories."""
-    lines1 = extract_text_from_pdf(file1)
-    lines2 = extract_text_from_pdf(file2)
+def compare_estimates(dryforce_file, adjuster_file):
+    lines1 = extract_text_from_pdf(dryforce_file)
+    lines2 = extract_text_from_pdf(adjuster_file)
     
-    categories1 = categorize_lines(lines1)
-    categories2 = categorize_lines(lines2)
+    rooms1 = extract_room_items(lines1)
+    rooms2 = extract_room_items(lines2)
     
-    differences = []
+    comparison_data = []
     
-    for category in set(categories1.keys()).union(categories2.keys()):
-        diff = list(difflib.unified_diff(
-            categories1.get(category, []),
-            categories2.get(category, []),
-            lineterm=''
-        ))
-        if diff:
-            differences.append((category, diff))
+    for room in rooms1.keys():
+        categories1 = rooms1.get(room, {})
+        categories2 = rooms2.get(room, {})
+        
+        all_categories = set(categories1.keys()).union(categories2.keys())
+        for category in all_categories:
+            items1 = {item[0]: item for item in categories1.get(category, [])}
+            items2 = {item[0]: item for item in categories2.get(category, [])}
+            
+            all_items = set(items1.keys()).union(items2.keys())
+            for item in all_items:
+                cost1, sf1 = items1.get(item, (item, 0, 0))[1:]
+                cost2, sf2 = items2.get(item, (item, 0, 0))[1:]
+                cost_diff = cost2 - cost1
+                sf_diff = sf2 - sf1
+                comparison_data.append([room, category, item, cost1, cost2, cost_diff, sf1, sf2, sf_diff])
     
-    save_differences(differences)
-    return differences
+    df = pd.DataFrame(comparison_data, columns=["Room", "Category", "Line Item", "Cost (DryForce)", "Cost (Adjuster)", "Cost Difference", "SF (DryForce)", "SF (Adjuster)", "SF Difference"])
+    return df
 
-def save_differences(differences):
-    """Saves the differences in a learning model."""
-    try:
-        with open("difference_history.pkl", "rb") as file:
-            history = pickle.load(file)
-    except FileNotFoundError:
-        history = []
-    
-    history.append(differences)
-    with open("difference_history.pkl", "wb") as file:
-        pickle.dump(history, file)
-
-def display_results(differences):
-    """Displays the comparison results in a GUI window."""
+def display_results(df):
     result_window = tk.Toplevel()
     result_window.title("Comparison Results")
+    result_window.geometry("1200x500")
     
-    text_area = scrolledtext.ScrolledText(result_window, wrap=tk.WORD, width=100, height=30)
-    for category, diff in differences:
-        text_area.insert(tk.INSERT, f"\n=== {category} ===\n")
-        text_area.insert(tk.INSERT, '\n'.join(diff) + "\n")
-    text_area.config(state=tk.DISABLED)
-    text_area.pack(padx=10, pady=10)
-
-def display_table(differences):
-    """Displays the comparison results in a table format."""
-    table_data = []
-    for category, diff in differences:
-        table_data.append([category, '\n'.join(diff)])
+    frame = ttk.Frame(result_window)
+    frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
     
-    table = tabulate(table_data, headers=["Category", "Differences"], tablefmt="grid")
-    print(table)
+    tree = ttk.Treeview(frame, columns=df.columns.tolist(), show='headings')
+    vsb = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+    hsb = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
+    tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+    
+    vsb.pack(side="right", fill="y")
+    hsb.pack(side="bottom", fill="x")
+    tree.pack(side="left", fill="both", expand=True)
+    
+    for col in df.columns:
+        tree.heading(col, text=col, anchor="center")
+        tree.column(col, anchor="center", width=150)
+    
+    for i, row in enumerate(df.itertuples(index=False)):
+        tag = "evenrow" if i % 2 == 0 else "oddrow"
+        tree.insert("", tk.END, values=row, tags=(tag,))
+    
+    tree.tag_configure("evenrow", background="#f2f2f2")
+    tree.tag_configure("oddrow", background="#ffffff")
 
 def upload_and_compare():
-    """Handles file selection and comparison through a GUI."""
-    root = tk.Tk()
-    root.withdraw()
-    file1 = filedialog.askopenfilename(title="Select First Estimate PDF", filetypes=[("PDF Files", "*.pdf")])
-    file2 = filedialog.askopenfilename(title="Select Second Estimate PDF", filetypes=[("PDF Files", "*.pdf")])
+    dryforce_file = filedialog.askopenfilename(title="Select DryForce Estimate PDF", filetypes=[("PDF Files", "*.pdf")])
+    adjuster_file = filedialog.askopenfilename(title="Select Adjuster Estimate PDF", filetypes=[("PDF Files", "*.pdf")])
     
-    if file1 and file2:
-        differences = compare_estimates(file1, file2)
-        
-        with open("estimate_differences.txt", "w", encoding="utf-8") as output_file:
-            for category, diff in differences:
-                output_file.write(f"\n=== {category} ===\n")
-                output_file.write('\n'.join(diff) + "\n")
-        
-        messagebox.showinfo("Comparison Completed", "Differences saved in estimate_differences.txt")
-        display_results(differences)
-        display_table(differences)
+    if dryforce_file and adjuster_file:
+        comparison_df = compare_estimates(dryforce_file, adjuster_file)
+        display_results(comparison_df)
+        messagebox.showinfo("Comparison Completed", "Results displayed successfully.")
     else:
         messagebox.showwarning("File Selection", "File selection cancelled.")
 
-def login():
-    """Displays the login window and handles user authentication."""
-    def authenticate():
-        username = username_entry.get()
-        password = password_entry.get()
-        
-        # Simple authentication logic (replace with your own logic)
-        if username == "admin" and password == "password":
-            login_window.destroy()
-            main()
-        else:
-            messagebox.showerror("Login Failed", "Invalid username or password")
-
-    login_window = tk.Tk()
-    login_window.title("Login")
-    login_window.geometry("300x150")
-
-    tk.Label(login_window, text="Username:").pack(pady=5)
-    username_entry = tk.Entry(login_window)
-    username_entry.pack(pady=5)
-
-    tk.Label(login_window, text="Password:").pack(pady=5)
-    password_entry = tk.Entry(login_window, show="*")
-    password_entry.pack(pady=5)
-
-    login_button = tk.Button(login_window, text="Login", command=authenticate)
-    login_button.pack(pady=10)
-
-    login_window.mainloop()
-
 def main():
-    """Creates the main GUI window."""
     root = tk.Tk()
     root.title("Estimate Comparison Tool")
-    root.geometry("1080x780")
-    
-    label = tk.Label(root, text="Upload two estimate PDFs to compare:")
-    label.pack(pady=10)
-    
-    compare_button = tk.Button(root, text="Compare Estimates", command=upload_and_compare)
-    compare_button.pack(pady=10)
-    
-    exit_button = tk.Button(root, text="Exit", command=root.quit)
-    exit_button.pack(pady=10)
-    
+    root.geometry("400x200")
+
+    tk.Label(root, text="Upload two estimate files to compare:").pack(pady=10)
+    tk.Button(root, text="Select Estimate Files", command=upload_and_compare).pack(pady=10)
+    tk.Button(root, text="Exit", command=root.quit).pack(pady=10)
+
     root.mainloop()
 
 if __name__ == "__main__":
-    login()
+    main()
